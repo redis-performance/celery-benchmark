@@ -1,0 +1,55 @@
+[package]
+name = "celery-bench"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "celery-bench"
+path = "src/main.rs"
+
+[dependencies]
+# No official Rust client exists for Celery/kombu (the closest, `rusty-celery`, is an
+# unofficial, largely dormant community crate) — we implement kombu's Redis transport
+# wire protocol directly against the `redis` crate for fidelity. See README "Protocol
+# compatibility" for exact kombu/celery source citations.
+#
+# tls-rustls-webpki-roots bundles Mozilla root CAs so TLS works without OS ca-certificates
+# tokio-rustls-comp: async TLS integration
+redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Latency histogram
+hdrhistogram = "7"
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Serialization — Celery/kombu message envelopes are JSON (kombu.utils.json), with the
+# inner (args, kwargs, embed) body additionally base64-encoded (kombu's default
+# body_encoding). See job.rs for the exact envelope struct.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+
+# Celery task/correlation IDs are UUID4 strings (Python's uuid.uuid4()), same shape
+# kombu uses for its own delivery_tag.
+uuid = { version = "1", features = ["v4"] }
+
+# Error handling
+anyhow = "1"
+
+# Table formatting
+comfy-table = "7"
+
+# Time formatting
+chrono = { version = "0.4", features = ["serde"] }
+
+# URL parsing — safe password encoding and redaction
+url = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
