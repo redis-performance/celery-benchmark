@@ -1,10 +1,12 @@
 name: Docker
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
   workflow_dispatch:
+  # Push-triggered publishing is disabled until DOCKERHUB_USERNAME/DOCKERHUB_TOKEN
+  # secrets are configured for this repo — until then it only runs on manual dispatch.
+  # push:
+  #   branches: [main]
+  #   tags: ['v*']
 
 jobs:
   build-push:
