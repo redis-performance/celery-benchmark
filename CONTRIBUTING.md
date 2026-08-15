@@ -58,9 +58,19 @@ All new behaviour must be covered by tests. Existing tests must pass before open
 
 ```bash
 cargo fmt --check
-cargo clippy -- -D warnings
+cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+`cargo test` runs both the unit tests in `src/*.rs` and the real-Redis integration
+tests in `tests/protocol_integration.rs` (the latter exercise the actual
+producer/worker code against a live Redis, not a reimplementation of it — see that
+file's module doc). They default to `redis://127.0.0.1:6379/15`; override with
+`CELERY_BENCH_TEST_REDIS_URL` if you're running Redis elsewhere. Any change to the
+protocol layer (`src/job.rs`, `src/producer.rs`, `src/worker.rs`) should extend these
+integration tests, not just the unit tests — unit tests can't catch a bug that only
+shows up once real Redis is involved (see the round-robin queue/priority correlation
+bug those tests were written to catch).
 
 For a full end-to-end smoke test (requires a running Redis on `127.0.0.1:6379`):
 
