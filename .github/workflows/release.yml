@@ -1,0 +1,85 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Native x86_64 build on a standard GitHub-hosted runner.
+          - target: x86_64-unknown-linux-gnu
+            runs-on: ubuntu-latest
+          # Native aarch64 build on a GitHub-hosted arm64 runner — no QEMU/cross-rs
+          # involved, so the resulting binary is built (and can be smoke-tested) on
+          # real ARM hardware rather than emulated.
+          - target: aarch64-unknown-linux-gnu
+            runs-on: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runs-on }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Verify architecture
+        run: file "target/${{ matrix.target }}/release/celery-bench"
+
+      - name: Sanity-check the binary actually runs (native, not emulated)
+        run: "target/${{ matrix.target }}/release/celery-bench --help"
+
+      - name: Package tarball + checksum
+        run: |
+          set -euo pipefail
+          STAGE="celery-bench-${{ matrix.target }}"
+          mkdir -p "$STAGE"
+          cp "target/${{ matrix.target }}/release/celery-bench" "$STAGE/"
+          cp LICENSE "$STAGE/"
+          cp README.md "$STAGE/"
+          tar czf "$STAGE.tar.gz" "$STAGE"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          rm -rf "$STAGE"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: celery-bench-${{ matrix.target }}
+          path: |
+            celery-bench-${{ matrix.target }}.tar.gz
+            celery-bench-${{ matrix.target }}.tar.gz.sha256
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: List release assets
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
