@@ -192,10 +192,23 @@ REDIS_IMAGE=redis:7.4 docker compose run --rm bench
 REDIS_URL=redis://myhost:6379/0 docker compose run --rm bench
 ```
 
-### Pre-built binary
+### Install from GitHub Release
+
+Pre-built static binaries for `x86_64` and `aarch64` Linux are attached to every
+[release](https://github.com/redis-performance/celery-benchmark/releases), each with
+a `.sha256` checksum alongside it:
 
 ```bash
-celery-bench --workers 10,50,100,200 --jobs 500000
+# Pick one target: x86_64-unknown-linux-gnu or aarch64-unknown-linux-gnu
+TARGET=x86_64-unknown-linux-gnu
+VERSION=v0.1.0
+
+curl -sLO https://github.com/redis-performance/celery-benchmark/releases/download/$VERSION/celery-bench-$TARGET.tar.gz
+curl -sLO https://github.com/redis-performance/celery-benchmark/releases/download/$VERSION/celery-bench-$TARGET.tar.gz.sha256
+sha256sum -c celery-bench-$TARGET.tar.gz.sha256
+
+tar xzf celery-bench-$TARGET.tar.gz
+./celery-bench-$TARGET/celery-bench --help
 ```
 
 ### From source
