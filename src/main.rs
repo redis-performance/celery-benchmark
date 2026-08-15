@@ -1,21 +1,16 @@
-mod job;
-mod metrics;
-mod producer;
-mod report;
-mod worker;
-
 use anyhow::{Context, Result};
+use celery_bench::job::{self, CeleryEnvelope};
+use celery_bench::metrics::{LatencyStats, Metrics, TrialResult};
+use celery_bench::worker::LoadWorker;
+use celery_bench::{producer, report};
 use clap::Parser;
 use hdrhistogram::Histogram;
-use job::CeleryEnvelope;
-use metrics::{LatencyStats, Metrics, TrialResult};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinSet;
-use worker::LoadWorker;
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
 
@@ -124,16 +119,20 @@ struct Cli {
 // ── Redis URL helpers ─────────────────────────────────────────────────────────
 
 fn build_redis_url(cli: &Cli) -> Result<String> {
-    let mut u =
-        url::Url::parse(&cli.url).with_context(|| format!("invalid Redis URL: {}", cli.url))?;
+    let mut u = url::Url::parse(&cli.url)
+        .with_context(|| format!("invalid Redis URL: {}", redact_url_best_effort(&cli.url)))?;
 
     if let Some(host) = &cli.host {
         u.set_host(Some(host))
             .map_err(|_| anyhow::anyhow!("invalid --host: {host}"))?;
     }
     if let Some(port) = cli.port {
-        u.set_port(Some(port))
-            .map_err(|_| anyhow::anyhow!("cannot set port on URL: {}", cli.url))?;
+        u.set_port(Some(port)).map_err(|_| {
+            anyhow::anyhow!(
+                "cannot set port on URL: {}",
+                redact_url_best_effort(&cli.url)
+            )
+        })?;
     }
     if cli.tls && u.scheme() == "redis" {
         u.set_scheme("rediss")
@@ -141,8 +140,12 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     }
     if let Some(password) = &cli.password {
         // url::Url::set_password percent-encodes special characters (e.g. '@', '/', ':')
-        u.set_password(Some(password))
-            .map_err(|_| anyhow::anyhow!("cannot set password on URL: {}", cli.url))?;
+        u.set_password(Some(password)).map_err(|_| {
+            anyhow::anyhow!(
+                "cannot set password on URL: {}",
+                redact_url_best_effort(&cli.url)
+            )
+        })?;
     }
     // Ensure db path is present
     if u.path().trim_matches('/').is_empty() {
@@ -163,6 +166,33 @@ fn redact_url(raw: &str) -> String {
         }
         Err(_) => raw.to_string(),
     }
+}
+
+/// Best-effort password redaction for use in error messages built from a URL that
+/// might not be well-formed enough for `url::Url::parse` to succeed (that's usually
+/// exactly why we're building an error message about it). Falls back to a manual
+/// scan for `scheme://user:password@` userinfo syntax so a malformed but
+/// credential-bearing --url never gets echoed verbatim into stderr / anyhow's error
+/// chain. Never used for anything except human-facing error text.
+fn redact_url_best_effort(s: &str) -> String {
+    if let Ok(u) = url::Url::parse(s) {
+        return redact_url(u.as_ref());
+    }
+    if let Some(scheme_end) = s.find("://") {
+        let after_scheme = &s[scheme_end + 3..];
+        if let Some(at) = after_scheme.find('@') {
+            let userinfo = &after_scheme[..at];
+            if let Some(colon) = userinfo.find(':') {
+                let mut redacted = String::with_capacity(s.len());
+                redacted.push_str(&s[..scheme_end + 3]);
+                redacted.push_str(&userinfo[..colon]);
+                redacted.push_str(":****@");
+                redacted.push_str(&after_scheme[at + 1..]);
+                return redacted;
+            }
+        }
+    }
+    s.to_string()
 }
 
 /// Sanitize a tag string to characters safe for use in filenames.
@@ -199,7 +229,7 @@ fn validate_output_path(path: &str) -> Result<()> {
 
 // ── Per-second latency percentile specs ──────────────────────────────────────
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 enum PercentileSpec {
     Quantile { name: String, q: f64 },
     Max,
@@ -235,6 +265,17 @@ fn parse_percentile_spec(s: &str) -> Result<PercentileSpec> {
         s if s.starts_with('p') => {
             let digits = &s[1..];
             anyhow::ensure!(!digits.is_empty(), "invalid percentile spec: '{s}'");
+            // "p100" reads naturally as "the 100th percentile" but the pXYZ scheme
+            // below treats digit COUNT as decimal placement (p50 -> 0.50, p999 ->
+            // 0.999), so "p100" would silently parse as 100/1000 = 0.10 (the 10th
+            // percentile) instead of erroring or meaning what it looks like it means.
+            // Reject it explicitly rather than let a plausible-looking typo produce a
+            // silently wrong (but in-range, so otherwise unvalidated) result.
+            anyhow::ensure!(
+                digits != "100",
+                "'{s}' is ambiguous (parses as the 10th percentile under this tool's \
+                 pXYZ scheme, not the 100th) — use 'max' for the 100th percentile"
+            );
             let n: u64 = digits
                 .parse()
                 .with_context(|| format!("invalid percentile spec: '{s}'"))?;
@@ -308,9 +349,28 @@ struct TrialConfig<'a> {
     percentile_specs: &'a [PercentileSpec],
 }
 
-fn empty_histogram() -> Histogram<u64> {
+/// Floor on the histogram's upper bound (60s) — preserves the tool's historical
+/// resolution for typical short trials regardless of --timeout.
+const MIN_HIST_MAX_US: u64 = 60_000_000;
+/// Ceiling on the histogram's upper bound (24h) — bounds memory even if --timeout is
+/// given an extreme value; HDRHistogram memory scales with log2(range), not range
+/// itself, so this is cheap, but an unbounded value is still worth capping.
+const MAX_HIST_MAX_US: u64 = 24 * 3600 * 1_000_000;
+
+/// `max_us` should cover the largest latency a value can realistically accumulate in
+/// this trial — i.e. the per-trial timeout. A job can sit in the queue for up to
+/// `timeout_secs` before the trial gives up, so a histogram bounded below that would
+/// silently DROP (not merely clamp) any latency past the bound: `Histogram::record`
+/// returns an Err on out-of-range values and callers here ignore it (`let _ =
+/// hist.record(v)`), which would understate `max`/`p99.9` and undercount
+/// `total_count` without any visible warning — exactly the kind of silently
+/// misleading number this tool exists to avoid producing. Bounding by the trial
+/// timeout (clamped to [MIN_HIST_MAX_US, MAX_HIST_MAX_US]) makes every reachable
+/// latency value recordable.
+fn empty_histogram(max_us: u64) -> Histogram<u64> {
+    let bound = max_us.clamp(MIN_HIST_MAX_US, MAX_HIST_MAX_US);
     // HDRHistogram requires low >= 1; values are clamped to .max(1) before recording
-    Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).expect("valid histogram bounds")
+    Histogram::<u64>::new_with_bounds(1, bound, 3).expect("valid histogram bounds")
 }
 
 async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResult> {
@@ -318,6 +378,7 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     let (done_tx, mut done_rx) = watch::channel(false);
     let done_tx = Arc::new(done_tx);
     let (latency_tx, latency_rx) = mpsc::unbounded_channel::<u64>();
+    let hist_max_us = cfg.timeout_secs.saturating_mul(1_000_000);
 
     // Per-second latency windows are pulled by the monitor, not pushed on a
     // separate timer: each tick the monitor sends a oneshot responder over
@@ -333,8 +394,8 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     // Workers send raw latency values through this single collector task rather
     // than contending on a shared Mutex<Histogram> — see worker.rs.
     let collector = tokio::spawn(async move {
-        let mut hist = empty_histogram();
-        let mut per_sec_hist = empty_histogram();
+        let mut hist = empty_histogram(hist_max_us);
+        let mut per_sec_hist = empty_histogram(hist_max_us);
         let mut rx = latency_rx;
         let mut snapshot_rx = snapshot_rx;
         loop {
@@ -460,7 +521,18 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
 
     // Wait for all jobs to complete, timeout, or every worker exiting early
     // (e.g. Redis became unreachable — no point waiting out the full timeout).
+    //
+    // `biased;` pins the poll order to the branches' textual order instead of tokio's
+    // default pseudo-random tie-break. Without it, on the rare tick where the last
+    // job's completion (done_rx flips true) and the join_set fully draining race to
+    // resolve in the same poll — e.g. every in-flight BRPOP happens to return in the
+    // same instant as the final one — tokio could pick the "all workers exited"
+    // branch, mislabeling a fully successful trial as `timed_out` (and tripping the
+    // process's overall exit(1)) purely on scheduling luck. Checking done_rx first
+    // makes "target reached" always win a genuine tie, which is the only outcome an
+    // operator reading the report would consider correct.
     tokio::select! {
+        biased;
         _ = done_rx.wait_for(|v| *v) => {},
         _ = tokio::time::sleep(Duration::from_secs(cfg.timeout_secs)) => {
             if !cfg.quiet { eprintln!(); }
@@ -506,7 +578,9 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
     }
 
     // Channel is now closed — collector drains buffered values and returns the histogram
-    let hist = collector.await.unwrap_or_else(|_| empty_histogram());
+    let hist = collector
+        .await
+        .unwrap_or_else(|_| empty_histogram(hist_max_us));
 
     let total_jobs = metrics.get_completed();
     let errors = metrics.get_errors();
@@ -542,16 +616,62 @@ async fn run_trial(cfg: &TrialConfig<'_>, n_workers: usize) -> Result<TrialResul
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+/// Sanity ceiling for --num-queues: each queue expands to 4 BRPOP keys and one entry
+/// in a Vec<String> built up front. Guards against an accidental huge value (e.g. an
+/// extra digit) trying to allocate an unbounded vector / building an unbounded BRPOP
+/// key list rather than failing with a clear error.
+const MAX_NUM_QUEUES: usize = 10_000;
 
+/// Sanity ceiling for a single --workers value: each unit opens one dedicated Redis
+/// connection (sequentially, at trial start) and spawns one tokio task. Guards
+/// against an accidental huge value exhausting file descriptors / memory instead of
+/// failing with a clear error.
+const MAX_WORKERS_PER_TRIAL: usize = 200_000;
+
+/// Validate CLI arguments that clap's type system can't express, failing fast with a
+/// clear message instead of letting a bad value crash or silently misbehave deep
+/// inside a trial (e.g. `--workers 0` would otherwise spawn zero workers and burn the
+/// full --timeout before reporting anything).
+fn validate_cli(cli: &Cli) -> Result<()> {
     anyhow::ensure!(cli.jobs > 0, "--jobs must be > 0");
     anyhow::ensure!(cli.num_queues > 0, "--num-queues must be > 0");
+    anyhow::ensure!(
+        cli.num_queues <= MAX_NUM_QUEUES,
+        "--num-queues {} exceeds the sanity limit of {MAX_NUM_QUEUES} (each queue expands to \
+         4 BRPOP keys)",
+        cli.num_queues
+    );
     anyhow::ensure!(!cli.priorities.is_empty(), "--priorities must not be empty");
     for &p in &cli.priorities {
         anyhow::ensure!(p <= 9, "--priorities values must be 0-9 (got {p}) — kombu's real max_priority is 9 (kombu/transport/virtual/base.py:473)");
     }
+    anyhow::ensure!(!cli.workers.is_empty(), "--workers must not be empty");
+    for &w in &cli.workers {
+        anyhow::ensure!(
+            w > 0,
+            "--workers values must be > 0 (got 0 — a trial with zero workers can never \
+             reach its job target and will burn the full --timeout before reporting a failure)"
+        );
+        anyhow::ensure!(
+            w <= MAX_WORKERS_PER_TRIAL,
+            "--workers value {w} exceeds the sanity limit of {MAX_WORKERS_PER_TRIAL} \
+             (one Redis connection is opened per worker)"
+        );
+    }
+    anyhow::ensure!(
+        cli.brpop_timeout_secs.is_finite() && cli.brpop_timeout_secs > 0.0,
+        "--brpop-timeout-secs must be a positive, finite number (got {}) — Redis rejects a \
+         non-positive BRPOP timeout, which would make every worker error-loop until --timeout",
+        cli.brpop_timeout_secs
+    );
+    anyhow::ensure!(cli.timeout > 0, "--timeout must be > 0");
+    Ok(())
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    let cli = Cli::parse();
+    validate_cli(&cli)?;
 
     let url = build_redis_url(&cli)?;
     let display_url = redact_url(&url);
@@ -573,6 +693,15 @@ async fn main() -> Result<()> {
     if let Some(out) = &cli.output {
         validate_output_path(out)?;
     }
+
+    // Parse --latency-percentiles before touching the network: a typo here (e.g.
+    // "p100") should fail immediately with a clear message, not only after we've
+    // already spent time connecting to Redis and fetching its tag.
+    let percentile_specs: Vec<PercentileSpec> = cli
+        .latency_percentiles
+        .iter()
+        .map(|s| parse_percentile_spec(s))
+        .collect::<Result<Vec<_>>>()?;
 
     let tag = match &cli.tag {
         Some(t) => sanitize_tag(t),
@@ -611,12 +740,6 @@ async fn main() -> Result<()> {
         .get_multiplexed_async_connection()
         .await
         .context("failed to connect to Redis")?;
-
-    let percentile_specs: Vec<PercentileSpec> = cli
-        .latency_percentiles
-        .iter()
-        .map(|s| parse_percentile_spec(s))
-        .collect::<Result<Vec<_>>>()?;
 
     let cfg = TrialConfig {
         url: &url,
@@ -861,5 +984,187 @@ mod tests {
     fn make_queue_names_single_and_multi() {
         assert_eq!(make_queue_names("celery", 1), vec!["celery"]);
         assert_eq!(make_queue_names("q", 3), vec!["q_0", "q_1", "q_2"]);
+    }
+
+    #[test]
+    fn parse_percentile_spec_rejects_ambiguous_p100() {
+        // "p100" would otherwise silently parse as 100/1000 = 0.10 (the 10th
+        // percentile) under the pXYZ digit-count-as-decimal-placement scheme — a
+        // textbook "looks right, means something else" trap. Must error, not just
+        // land in-range.
+        let err = parse_percentile_spec("p100").unwrap_err();
+        assert!(
+            err.to_string().contains("ambiguous"),
+            "expected an 'ambiguous' error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn parse_percentile_spec_p9999_still_valid_after_p100_guard() {
+        // Regression guard: the p100 special-case must not accidentally reject other
+        // 3+-digit specs.
+        assert!(parse_percentile_spec("p999").is_ok());
+        assert!(parse_percentile_spec("p9999").is_ok());
+        assert!(parse_percentile_spec("p101").is_ok()); // not "100", still parses (0.101)
+    }
+
+    // ── validate_cli ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn validate_cli_accepts_defaults() {
+        assert!(validate_cli(&base_cli()).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_jobs() {
+        let mut cli = base_cli();
+        cli.jobs = 0;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_num_queues() {
+        let mut cli = base_cli();
+        cli.num_queues = 0;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_huge_num_queues() {
+        let mut cli = base_cli();
+        cli.num_queues = MAX_NUM_QUEUES + 1;
+        assert!(validate_cli(&cli).is_err());
+        // ...but the limit itself is still accepted (boundary check).
+        cli.num_queues = MAX_NUM_QUEUES;
+        assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_rejects_empty_workers() {
+        let mut cli = base_cli();
+        cli.workers = vec![];
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_worker_level() {
+        let mut cli = base_cli();
+        cli.workers = vec![10, 0, 50];
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_huge_worker_level() {
+        let mut cli = base_cli();
+        cli.workers = vec![MAX_WORKERS_PER_TRIAL + 1];
+        assert!(validate_cli(&cli).is_err());
+        cli.workers = vec![MAX_WORKERS_PER_TRIAL];
+        assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_rejects_empty_priorities() {
+        let mut cli = base_cli();
+        cli.priorities = vec![];
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_priority_above_nine() {
+        let mut cli = base_cli();
+        cli.priorities = vec![0, 10];
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_accepts_duplicate_priorities() {
+        // Redundant, not invalid — a user round-robining onto the same priority
+        // multiple times just gets a lopsided (but well-defined) distribution.
+        let mut cli = base_cli();
+        cli.priorities = vec![0, 0, 0];
+        assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_and_negative_and_nan_brpop_timeout() {
+        let mut cli = base_cli();
+        cli.brpop_timeout_secs = 0.0;
+        assert!(validate_cli(&cli).is_err());
+        cli.brpop_timeout_secs = -1.0;
+        assert!(validate_cli(&cli).is_err());
+        cli.brpop_timeout_secs = f64::NAN;
+        assert!(validate_cli(&cli).is_err());
+        cli.brpop_timeout_secs = f64::INFINITY;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    #[test]
+    fn validate_cli_rejects_zero_timeout() {
+        let mut cli = base_cli();
+        cli.timeout = 0;
+        assert!(validate_cli(&cli).is_err());
+    }
+
+    // ── redact_url_best_effort ───────────────────────────────────────────────
+
+    #[test]
+    fn redact_url_best_effort_redacts_well_formed_url() {
+        let raw = "redis://:hunter2@127.0.0.1:6379/0";
+        let redacted = redact_url_best_effort(raw);
+        assert!(!redacted.contains("hunter2"));
+        assert!(redacted.contains("****"));
+    }
+
+    #[test]
+    fn redact_url_best_effort_redacts_even_when_url_parse_fails() {
+        // Deliberately malformed (space in host) so `url::Url::parse` errors out —
+        // the manual fallback scan must still find and mask the password rather than
+        // falling back to echoing the raw string.
+        let raw = "redis://user:hunter2@bad host:6379/0";
+        assert!(
+            url::Url::parse(raw).is_err(),
+            "test fixture must actually fail url::Url::parse"
+        );
+        let redacted = redact_url_best_effort(raw);
+        assert!(
+            !redacted.contains("hunter2"),
+            "password leaked through fallback path: {redacted}"
+        );
+        assert!(redacted.contains("****"), "no redaction marker: {redacted}");
+    }
+
+    #[test]
+    fn redact_url_best_effort_leaves_credential_free_malformed_url_unchanged() {
+        let raw = "redis://bad host:6379/0";
+        assert!(url::Url::parse(raw).is_err());
+        // No userinfo to redact — falls through to returning the input as-is, which
+        // is safe since there was never a secret in it.
+        assert_eq!(redact_url_best_effort(raw), raw);
+    }
+
+    // ── empty_histogram bound sizing ─────────────────────────────────────────
+
+    #[test]
+    fn empty_histogram_bound_respects_floor_and_ceiling() {
+        // A tiny --timeout still gets at least the historical 60s resolution.
+        let mut h = empty_histogram(1);
+        assert!(h.record(59_999_999).is_ok());
+        // An enormous --timeout is capped, not left to balloon unbounded.
+        let mut h = empty_histogram(u64::MAX);
+        assert!(h.record(MAX_HIST_MAX_US - 1).is_ok());
+    }
+
+    #[test]
+    fn empty_histogram_bound_covers_configured_timeout() {
+        // Regression for the original bug: default --timeout is 300s but the
+        // histogram used to be hardcoded to a 60s bound, silently dropping (not
+        // clamping — `Histogram::record` errors and the caller ignores it) any
+        // latency between 60s and the actual timeout.
+        let timeout_secs = 300u64;
+        let mut h = empty_histogram(timeout_secs * 1_000_000);
+        assert!(
+            h.record(290 * 1_000_000).is_ok(),
+            "a latency just under the configured --timeout must be recordable"
+        );
     }
 }

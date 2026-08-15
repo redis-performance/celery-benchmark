@@ -232,6 +232,33 @@ mod tests {
     }
 
     #[test]
+    fn priority_step_exact_step_boundaries() {
+        // One below every configured step must floor DOWN to the previous step, and
+        // the step value itself must floor to itself — the two cases most likely to
+        // be off-by-one in a bisect-style implementation.
+        for &step in PRIORITY_STEPS.iter() {
+            assert_eq!(
+                priority_step(step),
+                step,
+                "step {step} must floor to itself"
+            );
+        }
+        assert_eq!(priority_step(2), 0, "one below step 3 floors to step 0");
+        assert_eq!(priority_step(5), 3, "one below step 6 floors to step 3");
+        assert_eq!(priority_step(8), 6, "one below step 9 floors to step 6");
+    }
+
+    #[test]
+    fn priority_step_beyond_cli_range_still_floors_correctly() {
+        // --priorities is CLI-validated to 0-9, but `priority_step` itself is a plain
+        // pub fn with no such restriction — defend it directly against out-of-range
+        // callers (u8's full domain is 0-255) rather than relying on the CLI gate.
+        assert_eq!(priority_step(10), 9);
+        assert_eq!(priority_step(100), 9);
+        assert_eq!(priority_step(u8::MAX), 9);
+    }
+
+    #[test]
     fn q_for_pri_zero_priority_returns_bare_queue_name() {
         // Celery's default_priority = 0 (kombu/transport/virtual/base.py:471) — the
         // common case in production must resolve to the bare queue name, no suffix.

@@ -37,9 +37,17 @@ jobs:
         run: cargo build --release
 
       - name: Clippy
-        run: cargo clippy -- -D warnings
+        # --all-targets covers tests/ (integration tests) and #[cfg(test)] unit test
+        # modules too, not just the lib/bin — a lint-only issue confined to test code
+        # would otherwise slip past a plain `cargo clippy`.
+        run: cargo clippy --all-targets -- -D warnings
 
-      - name: Unit tests
+      - name: Unit + integration tests (real Redis)
+        # `cargo test` compiles and runs both the unit tests in src/*.rs AND the
+        # tests/protocol_integration.rs integration tests, which exercise the real
+        # producer/worker code against the `redis` service above (default target
+        # redis://127.0.0.1:6379/15 — same service, isolated db from the smoke test's
+        # db 0). No separate job needed: the service is already up for this step.
         run: cargo test
 
       - name: Smoke test (end-to-end against Redis service)

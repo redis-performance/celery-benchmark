@@ -3,6 +3,10 @@ name = "celery-bench"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "celery_bench"
+path = "src/lib.rs"
+
 [[bin]]
 name = "celery-bench"
 path = "src/main.rs"
@@ -53,3 +57,4 @@ url = "2"
 opt-level = 3
 lto = true
 codegen-units = 1
+strip = true
