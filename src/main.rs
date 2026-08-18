@@ -45,9 +45,11 @@ struct Cli {
     #[arg(long, env = "REDIS_TLS")]
     tls: bool,
 
-    /// Redis database number (default 13 — tool convention, see --url doc)
-    #[arg(long, default_value = "13")]
-    db: u8,
+    /// Redis database number. When omitted, the db in --url is used, falling back to 13
+    /// (the Ruby sidekiqload safety default). Note db > 0 does not exist on Redis Cluster
+    /// or most managed Redis, so `--db 0` is usually required against those.
+    #[arg(long)]
+    db: Option<u8>,
 
     /// Comma-separated concurrency levels — each becomes a separate trial.
     /// Each level spawns that many independent BRPOP loops, one dedicated Redis
@@ -147,9 +149,15 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
             )
         })?;
     }
-    // Ensure db path is present
-    if u.path().trim_matches('/').is_empty() {
-        u.set_path(&format!("/{}", cli.db));
+    // An explicit --db overrides whatever db --url carries. This used to apply only when the
+    // URL had NO path -- but the default --url is redis://127.0.0.1:6379/13, which always has
+    // one, so --db was silently inert. That mattered well beyond the flag: db 13 does not exist
+    // on Redis Cluster or most managed Redis, and `--db 0` (the documented way out) did nothing,
+    // so the tool could not connect to those endpoints at all.
+    if let Some(db) = cli.db {
+        u.set_path(&format!("/{db}"));
+    } else if u.path().trim_matches('/').is_empty() {
+        u.set_path("/13");
     }
 
     Ok(u.to_string())
@@ -893,7 +901,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
-            db: 0,
+            db: Some(0),
             workers: vec![10],
             jobs: 1000,
             warmup_jobs: 0,
@@ -1166,5 +1174,45 @@ mod tests {
             h.record(290 * 1_000_000).is_ok(),
             "a latency just under the configured --timeout must be recordable"
         );
+    }
+
+    #[test]
+    fn explicit_db_overrides_the_db_in_the_url() {
+        // Regression: --db used to apply only when --url carried no path. The default --url is
+        // redis://127.0.0.1:6379/13, which always has one, so --db was silently ignored -- and
+        // since db 13 does not exist on Redis Cluster or most managed Redis, `--db 0` was both
+        // the documented workaround and a no-op. Invisible without attaching MONITOR, hence this.
+        let cli = Cli {
+            url: "redis://127.0.0.1:6379/13".into(),
+            host: None,
+            port: None,
+            db: Some(0),
+            ..base_cli()
+        };
+        assert_eq!(build_redis_url(&cli).unwrap(), "redis://127.0.0.1:6379/0");
+    }
+
+    #[test]
+    fn omitted_db_keeps_the_url_db() {
+        let cli = Cli {
+            url: "redis://127.0.0.1:6379/7".into(),
+            host: None,
+            port: None,
+            db: None,
+            ..base_cli()
+        };
+        assert_eq!(build_redis_url(&cli).unwrap(), "redis://127.0.0.1:6379/7");
+    }
+
+    #[test]
+    fn omitted_db_and_pathless_url_falls_back_to_13() {
+        let cli = Cli {
+            url: "redis://127.0.0.1:6379".into(),
+            host: None,
+            port: None,
+            db: None,
+            ..base_cli()
+        };
+        assert_eq!(build_redis_url(&cli).unwrap(), "redis://127.0.0.1:6379/13");
     }
 }
