@@ -96,6 +96,14 @@ jobs:
           set -euo pipefail
 
           workdir="$(mktemp -d)"
+          # `mktemp -d` creates the directory 0700 (owner-only, no `x` for
+          # others) — redis-server runs as a *different* uid inside the
+          # container, so without world-traversable permissions on the
+          # directory itself it can't even stat the cert/key inside it,
+          # regardless of their own file modes ("Permission denied" reading
+          # the cert, observed when this was first wired up). It's a
+          # throwaway dir/cert regenerated every run, so 755/644 are fine.
+          chmod 755 "$workdir"
           openssl req -x509 -newkey rsa:2048 -keyout "$workdir/redis.key" \
             -out "$workdir/redis.crt" -days 1 -nodes -subj "/CN=localhost"
           # redis-server (running as a non-root user inside the container) must be
