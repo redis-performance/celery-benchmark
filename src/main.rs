@@ -138,7 +138,29 @@ fn parsed_scheme(url: &str) -> Option<String> {
     url::Url::parse(url).ok().map(|u| u.scheme().to_string())
 }
 
+/// True when `url` will resolve to a `rediss://` (TLS) connection once `build_redis_url`
+/// is done with it: either it is already `rediss://` (any casing — see `parsed_scheme`),
+/// or it is `redis://` and `--tls` is set (the only upgrade `build_redis_url` performs,
+/// at line ~157). Deliberately does NOT special-case any other scheme (e.g. `unix://`) —
+/// `--tls` never upgrades those, so `--tls --insecure --url unix:///tmp/redis.sock` must
+/// resolve to `false` here.
+///
+/// Both `validate_cli` (is `--insecure` meaningful?) and `build_redis_url` (should the
+/// `#insecure` fragment be set?) call this instead of duplicating the scheme check, so
+/// the two can never disagree about which URLs end up as TLS.
+fn resolves_to_tls_scheme(cli: &Cli) -> bool {
+    match parsed_scheme(&cli.url) {
+        Some(scheme) => scheme == "rediss" || (cli.tls && scheme == "redis"),
+        None => false,
+    }
+}
+
 fn build_redis_url(cli: &Cli) -> Result<String> {
+    // Computed against the ORIGINAL --url scheme, before any of the mutations below
+    // (host/port/scheme overrides) — matches what `validate_cli` already checked, so
+    // the two functions can't disagree about whether this URL resolves to TLS.
+    let insecure_applies = cli.insecure && resolves_to_tls_scheme(cli);
+
     let mut u = url::Url::parse(&cli.url)
         .with_context(|| format!("invalid Redis URL: {}", redact_url_best_effort(&cli.url)))?;
 
@@ -164,7 +186,7 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     // fragment still parses (that part isn't feature-gated) but every connection attempt then
     // hard-fails at connect time instead of skipping verification (see the Cargo.toml comment
     // next to the `redis` dependency, and README "TLS").
-    if cli.insecure && u.scheme() == "rediss" {
+    if insecure_applies {
         u.set_fragment(Some("insecure"));
     }
     if let Some(password) = &cli.password {
@@ -198,10 +220,16 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
 /// being passed — that path deserves the same warning `--insecure` gets, not silence.
 /// A URL that fails to parse is treated as not-insecure (`build_redis_url` already
 /// fails fast on an unparsable URL before this would ever be called with one).
+///
+/// Requires BOTH the `rediss://` scheme AND the `#insecure` fragment — redis-rs only
+/// ever consults the fragment on a `rediss://` URL, so e.g. `redis://host:6379/0#insecure`
+/// (plain, cleartext scheme) never actually disables any TLS certificate check and must
+/// not print the "TLS certificate verification is DISABLED" warning, which would be
+/// misleading for a connection that was never using TLS in the first place.
 fn url_disables_cert_verification(url: &str) -> bool {
     url::Url::parse(url)
         .ok()
-        .and_then(|u| u.fragment().map(|f| f == "insecure"))
+        .map(|u| u.scheme() == "rediss" && u.fragment() == Some("insecure"))
         .unwrap_or(false)
 }
 
@@ -715,12 +743,12 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         cli.brpop_timeout_secs
     );
     anyhow::ensure!(cli.timeout > 0, "--timeout must be > 0");
-    // Compare against the parsed (lowercased) scheme — see `parsed_scheme` doc comment
-    // — the same normalization `build_redis_url` applies, so this and that function
-    // never disagree about whether a given --url is "already rediss://".
-    let url_is_rediss = parsed_scheme(&cli.url).as_deref() == Some("rediss");
+    // Use the same TLS-resolution logic `build_redis_url` uses to decide whether the
+    // `#insecure` fragment applies — checking `cli.tls` alone (regardless of the URL's
+    // actual scheme) would wrongly accept e.g. `--tls --insecure --url unix:///tmp/redis.sock`,
+    // since --tls never upgrades a non-redis:// scheme (see `resolves_to_tls_scheme`).
     anyhow::ensure!(
-        !cli.insecure || cli.tls || url_is_rediss,
+        !cli.insecure || resolves_to_tls_scheme(cli),
         "--insecure only makes sense with --tls (or a rediss:// --url) — it has nothing to skip \
          verification for otherwise"
     );
@@ -1079,6 +1107,18 @@ mod tests {
         assert!(!url_disables_cert_verification("not a url"));
     }
 
+    #[test]
+    fn url_disables_cert_verification_false_for_plain_scheme_with_insecure_fragment() {
+        // Regression guard: redis-rs only ever consults the #insecure fragment on a
+        // rediss:// URL — on a plain redis:// URL the fragment is inert (the
+        // connection is cleartext TCP, there is no TLS certificate to fail to
+        // verify). The old check looked at the fragment alone and would have
+        // wrongly printed the "TLS certificate verification is DISABLED" warning
+        // for a connection that was never using TLS in the first place.
+        let url = "redis://host:6379/0#insecure";
+        assert!(!url_disables_cert_verification(url), "url={url}");
+    }
+
     // ── redis-rs's own parser, not just our URL string ──────────────────────────
     //
     // Every other test in this file (build_redis_url_appends_insecure_fragment_*,
@@ -1220,6 +1260,22 @@ mod tests {
         cli.url = "REDISS://127.0.0.1:6379/0".into();
         cli.insecure = true;
         assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_rejects_insecure_with_tls_but_unix_scheme() {
+        // Regression guard: `cli.tls` being true does NOT mean the URL resolves to
+        // rediss:// — build_redis_url only upgrades a `redis://` scheme, never
+        // `unix://`. The old check was `!cli.insecure || cli.tls || url_is_rediss`,
+        // which wrongly passed here because `cli.tls` alone short-circuited it,
+        // leaving --insecure silently inert (build_redis_url never sets the
+        // #insecure fragment on a unix:// URL). validate_cli must reject this.
+        let mut cli = base_cli();
+        cli.url = "unix:///tmp/redis.sock".into();
+        cli.tls = true;
+        cli.insecure = true;
+        let err = validate_cli(&cli).unwrap_err().to_string();
+        assert!(err.contains("--insecure"), "unexpected error: {err}");
     }
 
     #[test]

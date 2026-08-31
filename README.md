@@ -251,8 +251,10 @@ the server's certificate chain and hostname against the bundled Mozilla root CAs
 
 Test/staging/ephemeral benchmark deployments frequently present a self-signed or
 private-CA certificate that won't validate against those public roots. For that case,
-pass `--insecure` (or set `REDIS_TLS_INSECURE=1`) alongside `--tls` to skip certificate
-verification entirely:
+pass `--insecure` (or set `REDIS_TLS_INSECURE=true`) alongside `--tls` to skip certificate
+verification entirely. Note that clap's env-backed bool parser only accepts the literal
+strings `true`/`false` — `REDIS_TLS_INSECURE=1` (or `=0`) is a parse error, not a truthy
+value:
 
 ```bash
 celery-bench --tls --insecure --host my-staging-redis --port 6380
