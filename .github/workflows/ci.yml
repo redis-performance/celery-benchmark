@@ -83,3 +83,70 @@ jobs:
             .results[0].errors == 0 and
             .results[0].latency_us.total_count == 500
           ' /tmp/smoke.json
+
+      - name: TLS regression test (self-signed cert, real redis-server)
+        # Guards the second, previously-unreported bug this PR also fixes: redis-rs's
+        # rustls integration panics on ANY --tls connection (not just --insecure) if
+        # nothing installs a process-wide CryptoProvider (see src/tls.rs). Unit tests
+        # can't catch this — it only reproduces against a real TLS handshake — so this
+        # spins up an actual TLS-enabled redis-server (the `services:` block above
+        # can't take a custom command, hence a plain `docker run` here) and drives the
+        # built binary at it both without and with --insecure.
+        run: |
+          set -euo pipefail
+
+          workdir="$(mktemp -d)"
+          openssl req -x509 -newkey rsa:2048 -keyout "$workdir/redis.key" \
+            -out "$workdir/redis.crt" -days 1 -nodes -subj "/CN=localhost"
+          # redis-server (running as a non-root user inside the container) must be
+          # able to read the key; it's a throwaway cert regenerated every run.
+          chmod 644 "$workdir/redis.key"
+
+          docker run -d --name redis-tls \
+            -p 16380:16380 \
+            -v "$workdir:/certs:ro" \
+            redis:8.6 \
+            redis-server --port 0 \
+              --tls-port 16380 \
+              --tls-cert-file /certs/redis.crt \
+              --tls-key-file /certs/redis.key \
+              --tls-ca-cert-file /certs/redis.crt \
+              --tls-cluster no --tls-replication no --tls-auth-clients no
+
+          # Wait for the TLS listener to come up rather than a fixed sleep.
+          for i in $(seq 1 30); do
+            if docker exec redis-tls redis-cli --tls --insecure -p 16380 ping 2>/dev/null | grep -q PONG; then
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::redis-server TLS listener never came up"
+              docker logs redis-tls
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "--- without --insecure: must fail cleanly on the self-signed cert, not panic ---"
+          set +e
+          cargo run --release -- \
+            --url rediss://127.0.0.1:16380/0 \
+            --workers 1 --jobs 5 --timeout 10 --output - --quiet --tag ci-tls-no-insecure \
+            >/tmp/tls_no_insecure.stdout 2>/tmp/tls_no_insecure.stderr
+          status=$?
+          set -e
+          cat /tmp/tls_no_insecure.stderr
+          if [ "$status" -eq 0 ]; then
+            echo "::error::expected a non-zero exit connecting without --insecure against a self-signed cert, got 0"
+            exit 1
+          fi
+          if grep -qi "panic" /tmp/tls_no_insecure.stderr; then
+            echo "::error::TLS connection attempt panicked instead of failing cleanly with a cert error — see src/tls.rs (missing CryptoProvider install)"
+            exit 1
+          fi
+
+          echo "--- with --insecure: must succeed ---"
+          cargo run --release -- \
+            --url rediss://127.0.0.1:16380/0 --insecure \
+            --workers 1 --jobs 5 --timeout 10 --output - --quiet --tag ci-tls-insecure
+
+          docker rm -f redis-tls >/dev/null

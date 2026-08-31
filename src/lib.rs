@@ -10,4 +10,5 @@ pub mod job;
 pub mod metrics;
 pub mod producer;
 pub mod report;
+pub mod tls;
 pub mod worker;
