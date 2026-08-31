@@ -33,6 +33,11 @@ fn test_redis_url() -> String {
 }
 
 async fn connect() -> redis::aio::MultiplexedConnection {
+    // Idempotent — see src/tls.rs doc comment. `test_redis_url()` defaults to a plain
+    // `redis://` URL, but `CELERY_BENCH_TEST_REDIS_URL` can override it to a real
+    // `rediss://` endpoint, and without a process-wide CryptoProvider installed first,
+    // that connection attempt would panic instead of exercising the TLS path.
+    celery_bench::tls::install_crypto_provider();
     let client = redis::Client::open(test_redis_url()).expect("valid test Redis URL");
     client.get_multiplexed_async_connection().await.expect(
         "connect to the integration-test Redis — set CELERY_BENCH_TEST_REDIS_URL \

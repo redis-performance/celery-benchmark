@@ -1223,6 +1223,52 @@ mod tests {
     }
 
     #[test]
+    fn redis_tls_insecure_env_var_false_resolves_to_false_not_present_therefore_true() {
+        // Regression guard for the "env var present at all == true" bug class this org
+        // has hit before with boolean flag/env pairs (see sibling repos' identical
+        // fix): `--insecure`/`--tls` are plain `bool` fields with `env = "..."`, which
+        // clap backs with a `true`/`false`-only value parser for the env var — NOT
+        // clap's default flag behavior of "presence alone means true". Confirm the env
+        // var's actual VALUE is honored, not just its presence, for both flags this
+        // pattern applies to.
+        //
+        // Mutates process-wide env vars, so run everything needing a specific value
+        // for these two vars inside this single test to avoid races with other tests
+        // parsing `Cli` concurrently — no other test reads these two vars.
+        for (val, expected) in [("false", false), ("true", true)] {
+            std::env::set_var("REDIS_TLS_INSECURE", val);
+            std::env::set_var("REDIS_TLS", val);
+            let cli = Cli::try_parse_from(["celery-bench"])
+                .unwrap_or_else(|e| panic!("REDIS_TLS_INSECURE/REDIS_TLS={val:?} must parse: {e}"));
+            assert_eq!(
+                cli.insecure, expected,
+                "REDIS_TLS_INSECURE={val:?} must resolve insecure to {expected}"
+            );
+            assert_eq!(
+                cli.tls, expected,
+                "REDIS_TLS={val:?} must resolve tls to {expected}"
+            );
+        }
+        std::env::remove_var("REDIS_TLS_INSECURE");
+        std::env::remove_var("REDIS_TLS");
+
+        // Documents the actual (safe) failure mode for a value other than the literal
+        // "true"/"false" clap's bool value parser accepts for an env-backed flag: it is
+        // neither silently ignored (falling back to "present therefore true") nor
+        // silently coerced to false — clap hard-errors CLI parsing instead, so a typo'd
+        // env value like "0"/"1"/"yes"/"no" fails loudly rather than misconfiguring TLS
+        // verification silently.
+        std::env::set_var("REDIS_TLS_INSECURE", "0");
+        let err = Cli::try_parse_from(["celery-bench"])
+            .expect_err("REDIS_TLS_INSECURE=0 is not a valid clap bool and must error, not silently resolve to true or false");
+        assert!(
+            err.to_string().contains("--insecure"),
+            "expected the parse error to name --insecure, got: {err}"
+        );
+        std::env::remove_var("REDIS_TLS_INSECURE");
+    }
+
+    #[test]
     fn parsed_scheme_lowercases() {
         assert_eq!(
             parsed_scheme("REDISS://host:6380/0").as_deref(),

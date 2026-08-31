@@ -151,6 +151,17 @@ jobs:
             echo "::error::TLS connection attempt panicked instead of failing cleanly with a cert error — see src/tls.rs (missing CryptoProvider install)"
             exit 1
           fi
+          # A non-zero exit and no "panic" is too weak on its own — a container that
+          # never bound its port, or an unrelated future regression, would also satisfy
+          # both checks without ever actually rejecting the certificate. Assert on the
+          # specific rustls/webpki error text this binary emits for an untrusted
+          # self-signed cert (rustls's ConnectionAddr::TcpTls path returns this via
+          # redis-rs's connect error chain) so this step only passes when the cert was
+          # genuinely rejected.
+          if ! grep -q "invalid peer certificate" /tmp/tls_no_insecure.stderr; then
+            echo "::error::expected stderr to contain the certificate-rejection error \"invalid peer certificate\" (proving the connection failed because of the self-signed cert, not some unrelated failure) — see stderr above"
+            exit 1
+          fi
 
           echo "--- with --insecure: must succeed ---"
           cargo run --release -- \
