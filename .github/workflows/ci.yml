@@ -33,6 +33,22 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+      - name: Guard against tls-rustls-insecure feature regression
+        # There's no way for a binary crate to assert a *dependency's* Cargo feature
+        # is enabled at compile/test time — `#[cfg(feature = "...")]` only sees this
+        # crate's own features. If `tls-rustls-insecure` is ever dropped from the
+        # `redis` dependency in Cargo.toml (or from the resolved graph some other
+        # way), `--insecure` doesn't go quiet — every `--insecure`/`#insecure`
+        # connection attempt starts hard-failing at connect time instead (see the
+        # Cargo.toml comment next to the `redis` dependency, and the README "TLS"
+        # section). Check the resolved feature graph directly so that regression
+        # fails CI instead of surfacing as a support ticket.
+        run: |
+          cargo tree -e features -i redis --workspace | grep -q tls-rustls-insecure || {
+            echo "::error::tls-rustls-insecure is missing from the resolved 'redis' dependency's feature graph — --insecure would start hard-failing every connection instead of skipping cert verification. See the Cargo.toml comment next to the redis dependency."
+            exit 1
+          }
+
       - name: Build
         run: cargo build --release
 

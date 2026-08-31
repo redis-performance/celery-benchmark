@@ -127,6 +127,17 @@ struct Cli {
 
 // ── Redis URL helpers ─────────────────────────────────────────────────────────
 
+/// The parsed, lowercased scheme of `url`, or `None` if it doesn't parse as a URL at
+/// all. `url::Url` lowercases the scheme on parse (RFC 3986), so this is what both
+/// `validate_cli`'s "does --insecure make sense" check and `build_redis_url`'s "is
+/// this already rediss://" check must compare against — a raw, case-sensitive
+/// `starts_with("rediss://")` on the CLI-supplied string (validate_cli's previous
+/// check) would reject a perfectly legal `REDISS://host:6380/0`, which
+/// `url::Url::parse` accepts and normalizes fine.
+fn parsed_scheme(url: &str) -> Option<String> {
+    url::Url::parse(url).ok().map(|u| u.scheme().to_string())
+}
+
 fn build_redis_url(cli: &Cli) -> Result<String> {
     let mut u = url::Url::parse(&cli.url)
         .with_context(|| format!("invalid Redis URL: {}", redact_url_best_effort(&cli.url)))?;
@@ -149,8 +160,10 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     }
     // redis-rs recognizes the `#insecure` URL fragment (on any rediss:// URL, whether it
     // arrived via --tls or was already rediss:// in --url) to skip certificate verification —
-    // this requires the `tls-rustls-insecure` cargo feature to be enabled, otherwise the
-    // fragment is parsed but silently has no effect.
+    // this requires the `tls-rustls-insecure` cargo feature to be enabled. Without it, the
+    // fragment still parses (that part isn't feature-gated) but every connection attempt then
+    // hard-fails at connect time instead of skipping verification (see the Cargo.toml comment
+    // next to the `redis` dependency, and README "TLS").
     if cli.insecure && u.scheme() == "rediss" {
         u.set_fragment(Some("insecure"));
     }
@@ -687,8 +700,12 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         cli.brpop_timeout_secs
     );
     anyhow::ensure!(cli.timeout > 0, "--timeout must be > 0");
+    // Compare against the parsed (lowercased) scheme — see `parsed_scheme` doc comment
+    // — the same normalization `build_redis_url` applies, so this and that function
+    // never disagree about whether a given --url is "already rediss://".
+    let url_is_rediss = parsed_scheme(&cli.url).as_deref() == Some("rediss");
     anyhow::ensure!(
-        !cli.insecure || cli.tls || cli.url.starts_with("rediss://"),
+        !cli.insecure || cli.tls || url_is_rediss,
         "--insecure only makes sense with --tls (or a rediss:// --url) — it has nothing to skip \
          verification for otherwise"
     );
@@ -697,6 +714,13 @@ fn validate_cli(cli: &Cli) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // redis-rs's rustls integration enables no crypto backend of its own (see the
+    // `rustls` dependency comment in Cargo.toml) — rustls 0.23 requires the process to
+    // install one exactly once before any TLS connection is attempted, or it panics.
+    // `install_default()` returns Err if a provider is already installed (e.g. called
+    // twice in one process); that's fine here, so the result is ignored.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
     validate_cli(&cli)?;
 
@@ -980,6 +1004,85 @@ mod tests {
         assert!(!url.contains("insecure"), "unexpected fragment: {url}");
     }
 
+    // ── redis-rs's own parser, not just our URL string ──────────────────────────
+    //
+    // Every other test in this file (build_redis_url_appends_insecure_fragment_*,
+    // etc.) asserts on the STRING `build_redis_url` produces via `url::Url` — none of
+    // them touch redis-rs at all. That whole suite would still pass identically with
+    // `tls-rustls-insecure` removed from Cargo.toml again (the exact regression #7 /
+    // this PR fixes), because the fragment string "#insecure" appears in the URL
+    // either way — only what redis-rs's OWN connector does with that fragment at
+    // connect time depends on the feature (see the Cargo.toml comment next to the
+    // `redis` dependency, and connection.rs:1274-1279). These tests close that gap by
+    // running our built URL through redis-rs's real `IntoConnectionInfo` parser
+    // (the same parsing `redis::Client::open` performs) and asserting on the
+    // resulting `ConnectionAddr` struct itself.
+    use redis::{ConnectionAddr, IntoConnectionInfo};
+
+    #[test]
+    fn build_redis_url_insecure_parses_via_redis_rs_as_tls_insecure() {
+        let mut cli = base_cli();
+        cli.tls = true;
+        cli.insecure = true;
+        let url = build_redis_url(&cli).unwrap();
+        let info = url
+            .clone()
+            .into_connection_info()
+            .expect("redis-rs must accept our built URL");
+        match info.addr().clone() {
+            ConnectionAddr::TcpTls {
+                host,
+                port,
+                insecure,
+                ..
+            } => {
+                assert_eq!(host, "127.0.0.1");
+                assert_eq!(port, 6379);
+                assert!(
+                    insecure,
+                    "redis-rs's own parser must resolve --insecure to \
+                     ConnectionAddr::TcpTls {{ insecure: true, .. }}, url={url}"
+                );
+            }
+            other => panic!("expected ConnectionAddr::TcpTls, got {other:?} for url={url}"),
+        }
+    }
+
+    #[test]
+    fn build_redis_url_tls_without_insecure_parses_as_tls_secure() {
+        let mut cli = base_cli();
+        cli.tls = true;
+        let url = build_redis_url(&cli).unwrap();
+        let info = url
+            .clone()
+            .into_connection_info()
+            .expect("redis-rs must accept our built URL");
+        match info.addr().clone() {
+            ConnectionAddr::TcpTls { insecure, .. } => {
+                assert!(
+                    !insecure,
+                    "plain --tls without --insecure must parse as insecure: false, url={url}"
+                );
+            }
+            other => panic!("expected ConnectionAddr::TcpTls, got {other:?} for url={url}"),
+        }
+    }
+
+    #[test]
+    fn build_redis_url_plain_redis_parses_as_tcp_not_tls() {
+        let cli = base_cli();
+        let url = build_redis_url(&cli).unwrap();
+        let info = url
+            .clone()
+            .into_connection_info()
+            .expect("redis-rs must accept our built URL");
+        assert!(
+            matches!(info.addr(), ConnectionAddr::Tcp(..)),
+            "plain redis:// must parse as ConnectionAddr::Tcp, got {:?} for url={url}",
+            info.addr()
+        );
+    }
+
     #[test]
     fn build_redis_url_ignores_insecure_flag_without_tls_scheme() {
         // --insecure with a plain redis:// URL and no --tls has nothing to make insecure —
@@ -1014,6 +1117,33 @@ mod tests {
         cli.url = "rediss://127.0.0.1:6379/0".into();
         cli.insecure = true;
         assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_accepts_insecure_with_uppercase_rediss_scheme() {
+        // Regression guard: validate_cli used to compare the RAW cli.url string
+        // case-sensitively against "rediss://", while build_redis_url compared the
+        // already-lowercased *parsed* scheme. `url::Url` lowercases the scheme per RFC
+        // 3986, so REDISS://... parses to scheme() == "rediss" and build_redis_url
+        // would have accepted it — but the old validate_cli rejected it first, so the
+        // two functions disagreed about the same URL.
+        let mut cli = base_cli();
+        cli.url = "REDISS://127.0.0.1:6379/0".into();
+        cli.insecure = true;
+        assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn parsed_scheme_lowercases() {
+        assert_eq!(
+            parsed_scheme("REDISS://host:6380/0").as_deref(),
+            Some("rediss")
+        );
+        assert_eq!(
+            parsed_scheme("redis://host:6379/0").as_deref(),
+            Some("redis")
+        );
+        assert_eq!(parsed_scheme("not a url"), None);
     }
 
     #[test]
