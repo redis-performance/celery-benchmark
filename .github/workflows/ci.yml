@@ -33,6 +33,22 @@ jobs:
       - name: Format check
         run: cargo fmt --check
 
+      - name: Guard against tls-rustls-insecure feature regression
+        # There's no way for a binary crate to assert a *dependency's* Cargo feature
+        # is enabled at compile/test time — `#[cfg(feature = "...")]` only sees this
+        # crate's own features. If `tls-rustls-insecure` is ever dropped from the
+        # `redis` dependency in Cargo.toml (or from the resolved graph some other
+        # way), `--insecure` doesn't go quiet — every `--insecure`/`#insecure`
+        # connection attempt starts hard-failing at connect time instead (see the
+        # Cargo.toml comment next to the `redis` dependency, and the README "TLS"
+        # section). Check the resolved feature graph directly so that regression
+        # fails CI instead of surfacing as a support ticket.
+        run: |
+          cargo tree -e features -i redis --workspace | grep -q tls-rustls-insecure || {
+            echo "::error::tls-rustls-insecure is missing from the resolved 'redis' dependency's feature graph — --insecure would start hard-failing every connection instead of skipping cert verification. See the Cargo.toml comment next to the redis dependency."
+            exit 1
+          }
+
       - name: Build
         run: cargo build --release
 
@@ -67,3 +83,89 @@ jobs:
             .results[0].errors == 0 and
             .results[0].latency_us.total_count == 500
           ' /tmp/smoke.json
+
+      - name: TLS regression test (self-signed cert, real redis-server)
+        # Guards the second, previously-unreported bug this PR also fixes: redis-rs's
+        # rustls integration panics on ANY --tls connection (not just --insecure) if
+        # nothing installs a process-wide CryptoProvider (see src/tls.rs). Unit tests
+        # can't catch this — it only reproduces against a real TLS handshake — so this
+        # spins up an actual TLS-enabled redis-server (the `services:` block above
+        # can't take a custom command, hence a plain `docker run` here) and drives the
+        # built binary at it both without and with --insecure.
+        run: |
+          set -euo pipefail
+
+          workdir="$(mktemp -d)"
+          # `mktemp -d` creates the directory 0700 (owner-only, no `x` for
+          # others) — redis-server runs as a *different* uid inside the
+          # container, so without world-traversable permissions on the
+          # directory itself it can't even stat the cert/key inside it,
+          # regardless of their own file modes ("Permission denied" reading
+          # the cert, observed when this was first wired up). It's a
+          # throwaway dir/cert regenerated every run, so 755/644 are fine.
+          chmod 755 "$workdir"
+          openssl req -x509 -newkey rsa:2048 -keyout "$workdir/redis.key" \
+            -out "$workdir/redis.crt" -days 1 -nodes -subj "/CN=localhost"
+          # redis-server (running as a non-root user inside the container) must be
+          # able to read the key; it's a throwaway cert regenerated every run.
+          chmod 644 "$workdir/redis.key"
+
+          docker run -d --name redis-tls \
+            -p 16380:16380 \
+            -v "$workdir:/certs:ro" \
+            redis:8.6 \
+            redis-server --port 0 \
+              --tls-port 16380 \
+              --tls-cert-file /certs/redis.crt \
+              --tls-key-file /certs/redis.key \
+              --tls-ca-cert-file /certs/redis.crt \
+              --tls-cluster no --tls-replication no --tls-auth-clients no
+
+          # Wait for the TLS listener to come up rather than a fixed sleep.
+          for i in $(seq 1 30); do
+            if docker exec redis-tls redis-cli --tls --insecure -p 16380 ping 2>/dev/null | grep -q PONG; then
+              break
+            fi
+            if [ "$i" -eq 30 ]; then
+              echo "::error::redis-server TLS listener never came up"
+              docker logs redis-tls
+              exit 1
+            fi
+            sleep 1
+          done
+
+          echo "--- without --insecure: must fail cleanly on the self-signed cert, not panic ---"
+          set +e
+          cargo run --release -- \
+            --url rediss://127.0.0.1:16380/0 \
+            --workers 1 --jobs 5 --timeout 10 --output - --quiet --tag ci-tls-no-insecure \
+            >/tmp/tls_no_insecure.stdout 2>/tmp/tls_no_insecure.stderr
+          status=$?
+          set -e
+          cat /tmp/tls_no_insecure.stderr
+          if [ "$status" -eq 0 ]; then
+            echo "::error::expected a non-zero exit connecting without --insecure against a self-signed cert, got 0"
+            exit 1
+          fi
+          if grep -qi "panic" /tmp/tls_no_insecure.stderr; then
+            echo "::error::TLS connection attempt panicked instead of failing cleanly with a cert error — see src/tls.rs (missing CryptoProvider install)"
+            exit 1
+          fi
+          # A non-zero exit and no "panic" is too weak on its own — a container that
+          # never bound its port, or an unrelated future regression, would also satisfy
+          # both checks without ever actually rejecting the certificate. Assert on the
+          # specific rustls/webpki error text this binary emits for an untrusted
+          # self-signed cert (rustls's ConnectionAddr::TcpTls path returns this via
+          # redis-rs's connect error chain) so this step only passes when the cert was
+          # genuinely rejected.
+          if ! grep -q "invalid peer certificate" /tmp/tls_no_insecure.stderr; then
+            echo "::error::expected stderr to contain the certificate-rejection error \"invalid peer certificate\" (proving the connection failed because of the self-signed cert, not some unrelated failure) — see stderr above"
+            exit 1
+          fi
+
+          echo "--- with --insecure: must succeed ---"
+          cargo run --release -- \
+            --url rediss://127.0.0.1:16380/0 --insecure \
+            --workers 1 --jobs 5 --timeout 10 --output - --quiet --tag ci-tls-insecure
+
+          docker rm -f redis-tls >/dev/null

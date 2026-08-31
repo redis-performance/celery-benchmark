@@ -227,6 +227,7 @@ cargo build --release
 | `--port` | — | — | Override port component of URL |
 | `--password` | `REDIS_PASSWORD` | — | Auth (prefer env var — CLI exposes it in `ps`) |
 | `--tls` | `REDIS_TLS` | false | Enable TLS (`rediss://`) |
+| `--insecure` | `REDIS_TLS_INSECURE` | false | Skip TLS certificate verification (only meaningful with `--tls` / a `rediss://` URL) — for self-signed or private-CA certs, see "TLS" below |
 | `--db` | — | `13` | Database number (tool safety convention — NOT a Celery default, see below) |
 | `--workers` | — | `10,50,100,200` | Comma-separated concurrency levels — one trial each; each level runs that many independent BRPOP loops (one dedicated connection each) |
 | `--jobs` | — | `500000` | Total task messages per trial |
@@ -241,6 +242,60 @@ cargo build --release
 | `--timeout` | — | `300` | Per-trial timeout in seconds |
 | `--quiet` | — | false | Suppress per-second progress dots |
 | `--allow-flushdb` | `CELERY_BENCH_ALLOW_FLUSHDB` | false | FLUSHDB before each trial (default: DEL only the priority-expanded queue keys — safe on shared Redis) |
+
+### TLS
+
+`--tls` upgrades the connection URL's scheme to `rediss://`. By default this validates
+the server's certificate chain and hostname against the bundled Mozilla root CAs
+(`tls-rustls-webpki-roots`), same as any well-behaved TLS client.
+
+Test/staging/ephemeral benchmark deployments frequently present a self-signed or
+private-CA certificate that won't validate against those public roots. For that case,
+pass `--insecure` (or set `REDIS_TLS_INSECURE=true`) alongside `--tls` to skip certificate
+verification entirely. Note that clap's env-backed bool parser only accepts the literal
+strings `true`/`false` — `REDIS_TLS_INSECURE=1` (or `=0`) is a parse error, not a truthy
+value:
+
+```bash
+celery-bench --tls --insecure --host my-staging-redis --port 6380
+```
+
+Under the hood this appends the `#insecure` fragment to the connection URL, which is
+`redis-rs`'s own documented escape hatch (`rediss://host:port/#insecure`) — so passing
+`--url rediss://host:port/0#insecure` directly works too, without `--tls`/`--insecure`.
+This requires the `redis` crate's `tls-rustls-insecure` cargo feature, which this crate
+enables. Without it, the fragment is **not** silently ignored — verified directly
+against `redis-1.5.0`'s source (the version pinned in this crate's `Cargo.lock`):
+
+- Parsing `#insecure` into `ConnectionAddr::TcpTls { insecure: true, .. }` is gated on
+  `tls-rustls`/`tls-native-tls` (i.e. TLS support being compiled in at all), **not** on
+  `tls-rustls-insecure` — `src/connection.rs:548-563`. So the fragment always parses
+  successfully and always sets that flag, feature or no feature.
+- What actually reads that flag, `create_rustls_config`, is gated on `tls-rustls`
+  (`src/connection.rs:1166-1167`) and hard-fails the connection attempt when
+  `insecure` is `true` but `tls-rustls-insecure` is off:
+  `Err("Cannot create insecure client without tls-rustls-insecure feature")`
+  (`src/connection.rs:1274-1279`).
+
+So dropping `tls-rustls-insecure` doesn't make `--insecure` a no-op — it makes every
+`--insecure` (or bare `#insecure`) connection attempt fail outright with that error,
+turning "skip verification" into "cannot connect at all". Either way it's a trap when
+wiring up `redis-rs` TLS by hand — just not a *silent* one.
+
+**`--insecure` disables validation of the server's certificate chain and hostname.**
+Only use it against trusted networks (e.g. a benchmark's own private VPC), never
+across the public internet or against a server you don't control.
+
+**Crypto provider:** `redis-rs`'s rustls integration deliberately doesn't pick a
+crypto backend for you (its own `rustls` dependency is `default-features = false`) —
+`rustls` 0.23 requires the *application* to install one process-wide `CryptoProvider`
+before any TLS connection is attempted, or every TLS connection (`--tls`, with or
+without `--insecure`) panics. This crate depends directly on `rustls` (with the
+`ring` feature) — this crate IS used directly in our code: `src/tls.rs`'s
+`install_crypto_provider()` calls `rustls::crypto::ring::default_provider()` itself,
+which both enables rustls's `ring` feature for the one resolved `rustls` package and
+is the crate that call goes into. `main()` calls
+`celery_bench::tls::install_crypto_provider()` at startup.
 
 ### Multi-queue mode
 
