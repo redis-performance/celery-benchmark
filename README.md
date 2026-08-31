@@ -289,9 +289,11 @@ crypto backend for you (its own `rustls` dependency is `default-features = false
 `rustls` 0.23 requires the *application* to install one process-wide `CryptoProvider`
 before any TLS connection is attempted, or every TLS connection (`--tls`, with or
 without `--insecure`) panics. This crate depends directly on `rustls` (with the
-`ring` feature — unused in our own code, its only purpose is to make Cargo enable
-that feature for the one resolved `rustls` package) and installs it at the top of
-`main()`.
+`ring` feature) — this crate IS used directly in our code: `src/tls.rs`'s
+`install_crypto_provider()` calls `rustls::crypto::ring::default_provider()` itself,
+which both enables rustls's `ring` feature for the one resolved `rustls` package and
+is the crate that call goes into. `main()` calls
+`celery_bench::tls::install_crypto_provider()` at startup.
 
 ### Multi-queue mode
 
