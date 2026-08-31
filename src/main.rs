@@ -45,6 +45,13 @@ struct Cli {
     #[arg(long, env = "REDIS_TLS")]
     tls: bool,
 
+    /// Skip TLS certificate verification (only meaningful with --tls). Use this against
+    /// servers presenting a self-signed or private-CA certificate — the normal case for
+    /// test/staging/ephemeral benchmark deployments. INSECURE: disables validation of the
+    /// server's certificate chain and hostname, so only use this against trusted networks.
+    #[arg(long, env = "REDIS_TLS_INSECURE")]
+    insecure: bool,
+
     /// Redis database number. When omitted, the db in --url is used, falling back to 13
     /// (the Ruby sidekiqload safety default). Note db > 0 does not exist on Redis Cluster
     /// or most managed Redis, so `--db 0` is usually required against those.
@@ -139,6 +146,13 @@ fn build_redis_url(cli: &Cli) -> Result<String> {
     if cli.tls && u.scheme() == "redis" {
         u.set_scheme("rediss")
             .map_err(|_| anyhow::anyhow!("cannot upgrade scheme to rediss"))?;
+    }
+    // redis-rs recognizes the `#insecure` URL fragment (on any rediss:// URL, whether it
+    // arrived via --tls or was already rediss:// in --url) to skip certificate verification —
+    // this requires the `tls-rustls-insecure` cargo feature to be enabled, otherwise the
+    // fragment is parsed but silently has no effect.
+    if cli.insecure && u.scheme() == "rediss" {
+        u.set_fragment(Some("insecure"));
     }
     if let Some(password) = &cli.password {
         // url::Url::set_password percent-encodes special characters (e.g. '@', '/', ':')
@@ -673,6 +687,11 @@ fn validate_cli(cli: &Cli) -> Result<()> {
         cli.brpop_timeout_secs
     );
     anyhow::ensure!(cli.timeout > 0, "--timeout must be > 0");
+    anyhow::ensure!(
+        !cli.insecure || cli.tls || cli.url.starts_with("rediss://"),
+        "--insecure only makes sense with --tls (or a rediss:// --url) — it has nothing to skip \
+         verification for otherwise"
+    );
     Ok(())
 }
 
@@ -901,6 +920,7 @@ mod tests {
             port: None,
             password: None,
             tls: false,
+            insecure: false,
             db: Some(0),
             workers: vec![10],
             jobs: 1000,
@@ -937,6 +957,63 @@ mod tests {
         cli.tls = true;
         let url = build_redis_url(&cli).unwrap();
         assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
+    }
+
+    #[test]
+    fn build_redis_url_appends_insecure_fragment_with_tls_and_insecure() {
+        let mut cli = base_cli();
+        cli.tls = true;
+        cli.insecure = true;
+        let url = build_redis_url(&cli).unwrap();
+        assert!(url.starts_with("rediss://"), "expected rediss:// got {url}");
+        assert!(
+            url.ends_with("#insecure"),
+            "expected #insecure fragment, got {url}"
+        );
+    }
+
+    #[test]
+    fn build_redis_url_omits_insecure_fragment_when_flag_not_set() {
+        let mut cli = base_cli();
+        cli.tls = true;
+        let url = build_redis_url(&cli).unwrap();
+        assert!(!url.contains("insecure"), "unexpected fragment: {url}");
+    }
+
+    #[test]
+    fn build_redis_url_ignores_insecure_flag_without_tls_scheme() {
+        // --insecure with a plain redis:// URL and no --tls has nothing to make insecure —
+        // validate_cli() rejects this combination before build_redis_url() is ever reached,
+        // but build_redis_url() itself must still not add the fragment to a redis:// URL.
+        let mut cli = base_cli();
+        cli.insecure = true;
+        let url = build_redis_url(&cli).unwrap();
+        assert!(url.starts_with("redis://"), "expected redis:// got {url}");
+        assert!(!url.contains("insecure"), "unexpected fragment: {url}");
+    }
+
+    #[test]
+    fn validate_cli_rejects_insecure_without_tls() {
+        let mut cli = base_cli();
+        cli.insecure = true;
+        let err = validate_cli(&cli).unwrap_err().to_string();
+        assert!(err.contains("--insecure"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn validate_cli_accepts_insecure_with_tls() {
+        let mut cli = base_cli();
+        cli.tls = true;
+        cli.insecure = true;
+        assert!(validate_cli(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_cli_accepts_insecure_with_rediss_url() {
+        let mut cli = base_cli();
+        cli.url = "rediss://127.0.0.1:6379/0".into();
+        cli.insecure = true;
+        assert!(validate_cli(&cli).is_ok());
     }
 
     #[test]

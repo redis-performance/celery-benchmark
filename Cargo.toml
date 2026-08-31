@@ -19,7 +19,10 @@ path = "src/main.rs"
 #
 # tls-rustls-webpki-roots bundles Mozilla root CAs so TLS works without OS ca-certificates
 # tokio-rustls-comp: async TLS integration
-redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots"] }
+# tls-rustls-insecure: makes the documented rediss://host:port/#insecure URL fragment (and our
+# --insecure flag, which sets that same fragment) actually skip certificate verification.
+# Without this feature the fragment is parsed but has no effect (see README "TLS" section).
+redis = { version = "1", features = ["tokio-comp", "tokio-rustls-comp", "tls-rustls-webpki-roots", "tls-rustls-insecure"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
